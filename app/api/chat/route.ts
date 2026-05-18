@@ -6,10 +6,9 @@ import {
 } from "@/lib/llama";
 import { formatResultsForModel, webSearch } from "@/lib/web-search";
 
-// Tool calling のループ本体。
-// LLM 呼び出し → ツール要求の検出 → ツール実行 → 結果を会話に戻す → 再度 LLM、
-// を最終回答が出るまで繰り返す。各段を step として記録し UI に返す
-// (= Tool calling の内部動作を可視化する)。
+// Tool calling のループ本体を SSE でストリーミングする。
+// 各段の開始(phase)と結果(step)をリアルタイムに送出し、
+// クライアント側のワークフロー図がライブで進行できるようにする。
 
 export const dynamic = "force-dynamic";
 
@@ -26,6 +25,15 @@ type Step =
   | { type: "final"; text: string }
   | { type: "error"; message: string };
 
+// ワークフローのフェーズ。クライアントの図のノードに対応する。
+type Phase = "llm" | "tool_call" | "search" | "feedback" | "final";
+
+type StreamEvent =
+  | { kind: "phase"; phase: Phase; iter: number }
+  | { kind: "step"; step: Step }
+  | { kind: "answer"; answer: string }
+  | { kind: "done" };
+
 export async function POST(request: Request) {
   const { messages } = (await request.json()) as {
     messages: { role: "user" | "assistant"; content: string }[];
@@ -36,51 +44,88 @@ export async function POST(request: Request) {
     ...messages,
   ];
 
-  const steps: Step[] = [];
+  const encoder = new TextEncoder();
 
-  try {
-    for (let i = 0; i < MAX_STEPS; i++) {
-      const raw = await chatCompletion(convo);
-      steps.push({ type: "llm_raw", content: raw });
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (e: StreamEvent) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(e)}\n\n`));
+      };
 
-      const toolCall = parseToolCall(raw);
+      try {
+        for (let i = 0; i < MAX_STEPS; i++) {
+          const iter = i + 1;
 
-      if (!toolCall) {
-        // ツール要求なし = これが最終回答
-        steps.push({ type: "final", text: raw });
-        return Response.json({ steps, answer: raw });
+          send({ kind: "phase", phase: "llm", iter });
+          const raw = await chatCompletion(convo);
+          send({ kind: "step", step: { type: "llm_raw", content: raw } });
+
+          const toolCall = parseToolCall(raw);
+
+          if (!toolCall) {
+            // ツール要求なし = これが最終回答
+            send({ kind: "phase", phase: "final", iter });
+            send({ kind: "step", step: { type: "final", text: raw } });
+            send({ kind: "answer", answer: raw });
+            send({ kind: "done" });
+            controller.close();
+            return;
+          }
+
+          // モデルがツールを要求した
+          send({ kind: "phase", phase: "tool_call", iter });
+          send({
+            kind: "step",
+            step: { type: "tool_call", query: toolCall.query },
+          });
+
+          // SearXNG 検索実行
+          send({ kind: "phase", phase: "search", iter });
+          const results = await webSearch(toolCall.query);
+          send({
+            kind: "step",
+            step: {
+              type: "tool_result",
+              query: toolCall.query,
+              results,
+            },
+          });
+
+          // 結果を会話に戻して次ターンへ
+          send({ kind: "phase", phase: "feedback", iter });
+          convo.push({ role: "assistant", content: raw });
+          convo.push({
+            role: "user",
+            content:
+              `web_search("${toolCall.query}") の結果:\n\n` +
+              formatResultsForModel(results) +
+              `\n\nこの結果を踏まえてユーザーに日本語で最終回答してください。` +
+              `さらに検索が必要なら再度ツール JSON を出力しても構いません。`,
+          });
+        }
+
+        // MAX_STEPS 到達: 最後にもう一度、検索結果を踏まえた回答を強制
+        send({ kind: "phase", phase: "final", iter: MAX_STEPS });
+        const finalRaw = await chatCompletion(convo);
+        send({ kind: "step", step: { type: "final", text: finalRaw } });
+        send({ kind: "answer", answer: finalRaw });
+        send({ kind: "done" });
+        controller.close();
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        send({ kind: "step", step: { type: "error", message } });
+        send({ kind: "answer", answer: "" });
+        send({ kind: "done" });
+        controller.close();
       }
+    },
+  });
 
-      // モデルがツールを要求した
-      steps.push({ type: "tool_call", query: toolCall.query });
-
-      const results = await webSearch(toolCall.query);
-      steps.push({
-        type: "tool_result",
-        query: toolCall.query,
-        results,
-      });
-
-      // ツールの生出力(モデルの JSON 要求)と実行結果を会話に積み増し、
-      // 次ターンでモデルに結果を踏まえさせる
-      convo.push({ role: "assistant", content: raw });
-      convo.push({
-        role: "user",
-        content:
-          `web_search("${toolCall.query}") の結果:\n\n` +
-          formatResultsForModel(results) +
-          `\n\nこの結果を踏まえてユーザーに日本語で最終回答してください。` +
-          `さらに検索が必要なら再度ツール JSON を出力しても構いません。`,
-      });
-    }
-
-    // MAX_STEPS 到達: 最後にもう一度、検索結果を踏まえた回答を強制
-    const finalRaw = await chatCompletion(convo);
-    steps.push({ type: "final", text: finalRaw });
-    return Response.json({ steps, answer: finalRaw });
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    steps.push({ type: "error", message });
-    return Response.json({ steps, answer: "", error: message }, { status: 500 });
-  }
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
+  });
 }
