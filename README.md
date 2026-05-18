@@ -1,20 +1,24 @@
 # Tool Calling Demo
 
-ローカル LLM (`gemma-4-e4b-it` / llama-server) に `web_search` ツールを
-プロンプトベース Tool calling で持たせ、各ステップの内部動作を可視化するデモ。
+ローカル LLM (`gemma-4-e4b-it` / llama-server) に `web_search` /
+`fetch_page` ツールをプロンプトベース Tool calling で持たせ、
+各ステップの内部動作を可視化するデモ。
 
 検索バックエンドは API キー不要のローカル SearXNG（Docker）。
 
 ## アーキテクチャ
 
 ```
-[Chat UI] → [/api/chat (Tool callingループ)]
+[Chat UI] ←SSE← [/api/chat (Tool callingループ)]
                ├─ llama-server /v1/chat/completions
-               │    システムプロンプトで web_search 仕様を注入
-               │    モデルが {"tool":"web_search","query":"..."} を出力
-               ├─ web_search 実装: SearXNG ?format=json を fetch
+               │    システムプロンプトで 2ツールの仕様を注入
+               │    モデルが {"tool":"web_search","query":"..."} または
+               │    {"tool":"fetch_page","url":"..."} を出力
+               ├─ web_search: SearXNG ?format=json を fetch
                │    タイトル+URL+スニペットを上位5件に整形
-               └─ 結果を会話に戻し最終回答までループ(最大4段)
+               ├─ fetch_page: URL を取得し本文テキストを抽出(最大4000字)
+               │    → 概要では不十分な具体的事実(天気/数値等)に対応
+               └─ 結果を会話に戻し最終回答までループ(最大5段)
 ```
 
 `gemma-4-e4b-it` は OpenAI の `tools` パラメータに非対応のため、
@@ -53,7 +57,8 @@
 | パス | 役割 |
 |---|---|
 | `lib/web-search.ts` | `web_search` ツール実体（fetch・URLエンコード・結果整形） |
+| `lib/fetch-page.ts` | `fetch_page` ツール実体（URL取得・本文テキスト抽出） |
 | `lib/llama.ts` | llama-server クライアント／仕様プロンプト／ツール JSON パーサ |
-| `app/api/chat/route.ts` | Tool calling ループ。各段を step として返す |
-| `app/page.tsx` | ステップ可視化チャット UI（回答は Markdown 表示） |
+| `app/api/chat/route.ts` | Tool calling ループ(SSE)。各段を step として返す |
+| `app/page.tsx` | ステップ可視化チャット UI＋ワークフロー図（回答は Markdown 表示） |
 | `docker-compose.yml`, `searxng/settings.yml` | ローカル SearXNG |
