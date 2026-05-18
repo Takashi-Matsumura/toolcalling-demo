@@ -1,36 +1,59 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Tool Calling Demo
 
-## Getting Started
+ローカル LLM (`gemma-4-e4b-it` / llama-server) に `web_search` ツールを
+プロンプトベース Tool calling で持たせ、各ステップの内部動作を可視化するデモ。
 
-First, run the development server:
+検索バックエンドは API キー不要のローカル SearXNG（Docker）。
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## アーキテクチャ
+
+```
+[Chat UI] → [/api/chat (Tool callingループ)]
+               ├─ llama-server /v1/chat/completions
+               │    システムプロンプトで web_search 仕様を注入
+               │    モデルが {"tool":"web_search","query":"..."} を出力
+               ├─ web_search 実装: SearXNG ?format=json を fetch
+               │    タイトル+URL+スニペットを上位5件に整形
+               └─ 結果を会話に戻し最終回答までループ(最大4段)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`gemma-4-e4b-it` は OpenAI の `tools` パラメータに非対応のため、
+「ツールを使う時は決まった JSON だけ出力せよ」と指示し、アプリ側で
+その JSON を検出・実行するプロンプトベース方式を採用している。
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## セットアップ
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. 環境変数を用意
 
-## Learn More
+   ```sh
+   cp .env.example .env.local
+   ```
 
-To learn more about Next.js, take a look at the following resources:
+2. SearXNG を起動（JSON API を有効化済み）
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+   ```sh
+   docker compose up -d
+   # 疎通確認: JSON が返れば OK
+   curl 'http://localhost:8888/search?q=test&format=json' | head -c 100
+   ```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+3. llama-server を `http://localhost:8080` で起動（`gemma-4-e4b-it`）
 
-## Deploy on Vercel
+4. 開発サーバ
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+   ```sh
+   npm install
+   npm run dev
+   ```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+   `http://localhost:3000` を開く。
+
+## 構成
+
+| パス | 役割 |
+|---|---|
+| `lib/web-search.ts` | `web_search` ツール実体（fetch・URLエンコード・結果整形） |
+| `lib/llama.ts` | llama-server クライアント／仕様プロンプト／ツール JSON パーサ |
+| `app/api/chat/route.ts` | Tool calling ループ。各段を step として返す |
+| `app/page.tsx` | ステップ可視化チャット UI（回答は Markdown 表示） |
+| `docker-compose.yml`, `searxng/settings.yml` | ローカル SearXNG |
