@@ -1,0 +1,18 @@
+# SearXNG 設定。重要なのは search.formats に json を含めること
+# (これが無いと ?format=json が 403 になり、ツールから結果を取れない)。
+use_default_settings: true
+
+server:
+  # 任意のランダム文字列に変更してよい (ローカルデモなので固定で可)
+  secret_key: "toolcalling-demo-local-secret-change-me"
+  # ローカル単独利用なのでレートリミッタは無効化
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+  # 日本語クエリも扱うため言語は autodetect 寄りに
+  default_lang: "auto"
+  safe_search: 0

@@ -1,0 +1,14 @@
+# ローカル SearXNG: web_search ツールのバックエンド。
+# 公開インスタンスは JSON API をブロック/レート制限するため、localhost で自前運用する。
+# 起動: docker compose up -d  /  停止: docker compose down
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: toolcalling-searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+    restart: unless-stopped
