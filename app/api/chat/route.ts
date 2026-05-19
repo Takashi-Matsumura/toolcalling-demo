@@ -61,6 +61,7 @@ type StreamEvent =
   | { kind: "phase"; phase: Phase; iter: number }
   | { kind: "step"; step: Step }
   | { kind: "answer"; answer: string }
+  | { kind: "context"; messages: ChatMessage[] }
   | { kind: "done" };
 
 export async function POST(request: Request) {
@@ -82,6 +83,9 @@ export async function POST(request: Request) {
       };
       const finish = (answer: string) => {
         send({ kind: "answer", answer });
+        // このターンで構築した文脈(ツール結果入り)を渡し、
+        // クライアントが「回答だけ再生成」できるようにする。
+        send({ kind: "context", messages: convo });
         send({ kind: "done" });
         controller.close();
       };

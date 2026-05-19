@@ -10,6 +10,7 @@ import {
   Code2,
   FileText,
   GraduationCap,
+  RefreshCw,
   Search,
   Trash2,
   type LucideIcon,
@@ -61,12 +62,17 @@ type StreamEvent =
   | { kind: "phase"; phase: Phase; iter: number }
   | { kind: "step"; step: Step }
   | { kind: "answer"; answer: string }
+  | { kind: "context"; messages: ChatMsg[] }
   | { kind: "done" };
+
+type ChatMsg = { role: "system" | "user" | "assistant"; content: string };
 
 type Turn = {
   user: string;
   steps: Step[];
   answer: string;
+  // このターンで構築された文脈(ツール結果入り)。回答だけ再生成に使う。
+  context: ChatMsg[];
 };
 
 // 1ループ分の記録。これを配列で積むことで履歴を見せる。
@@ -81,6 +87,7 @@ type LoopIter = {
   fetchOk: boolean | null;
   paperCount: number | null;
   repoCount: number | null;
+  regen?: boolean; // 回答再生成で追加されたステップか
   status: "running" | "done" | "error";
 };
 
@@ -139,6 +146,7 @@ export default function Home() {
   const [live, setLive] = useState<Turn | null>(null);
   const [wf, setWf] = useState<WorkflowState>(IDLE_WF);
   const [loading, setLoading] = useState(false);
+  const [regenIdx, setRegenIdx] = useState<number | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -167,7 +175,7 @@ export default function Home() {
       { role: "assistant" as const, content: t.answer },
     ]);
 
-    const liveTurn: Turn = { user: text, steps: [], answer: "" };
+    const liveTurn: Turn = { user: text, steps: [], answer: "", context: [] };
     setLive({ ...liveTurn });
     setWf({ iters: [], status: "running" });
 
@@ -289,6 +297,8 @@ export default function Home() {
           } else if (ev.kind === "answer") {
             liveTurn.answer = ev.answer;
             setLive({ ...liveTurn });
+          } else if (ev.kind === "context") {
+            liveTurn.context = ev.messages;
           } else if (ev.kind === "done") {
             setTurns((prev) => [...prev, { ...liveTurn }]);
             setLive(null);
@@ -322,6 +332,67 @@ export default function Home() {
     setLive(null);
     setWf(IDLE_WF);
     setInput("");
+  }
+
+  // ワークフローは回さず、そのターンの文脈から回答だけ作り直す。
+  async function regenerate(index: number) {
+    if (loading || regenIdx !== null) return;
+    const turn = turns[index];
+    if (!turn || turn.context.length === 0) return;
+    setRegenIdx(index);
+
+    // ワークフロー履歴にも「最終回答だけ再実行している」ことを示す
+    // 専用ステップを積む(ツール群は再実行しない)。
+    setWf((w) => ({
+      status: "running",
+      iters: [
+        ...w.iters.map((it) =>
+          it.status === "running" ? { ...it, status: "done" as const } : it,
+        ),
+        {
+          n: (w.iters[w.iters.length - 1]?.n ?? 0) + 1,
+          kind: "answer",
+          phase: "final",
+          tool: null,
+          arg: "",
+          resultCount: null,
+          fetchChars: null,
+          fetchOk: null,
+          paperCount: null,
+          repoCount: null,
+          regen: true,
+          status: "running",
+        },
+      ],
+    }));
+
+    let ok = false;
+    try {
+      const res = await fetch("/api/regenerate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ context: turn.context }),
+      });
+      const data = (await res.json()) as { answer?: string; error?: string };
+      if (data.answer) {
+        ok = true;
+        setTurns((prev) =>
+          prev.map((t, i) =>
+            i === index ? { ...t, answer: data.answer as string } : t,
+          ),
+        );
+      }
+    } finally {
+      setRegenIdx(null);
+      setWf((w) => ({
+        status: ok ? "done" : "error",
+        iters: w.iters.map((it, i) =>
+          i === w.iters.length - 1
+            ? { ...it, status: ok ? ("done" as const) : ("error" as const) }
+            : it,
+        ),
+      }));
+    }
   }
 
   const allTurns = live ? [...turns, live] : turns;
@@ -406,10 +477,31 @@ export default function Home() {
               ))}
 
               {t.answer && (
-                <div className="markdown rounded-2xl bg-zinc-100 px-4 py-3 dark:bg-zinc-800">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {t.answer}
-                  </ReactMarkdown>
+                <div className="flex flex-col items-start gap-1">
+                  <div
+                    className={[
+                      "markdown w-full rounded-2xl bg-zinc-100 px-4 py-3 dark:bg-zinc-800",
+                      regenIdx === i ? "opacity-50" : "",
+                    ].join(" ")}
+                  >
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {t.answer}
+                    </ReactMarkdown>
+                  </div>
+                  {i < turns.length && t.context.length > 0 && (
+                    <button
+                      onClick={() => regenerate(i)}
+                      disabled={loading || regenIdx !== null}
+                      title="ワークフローは回さず、この回答だけ別表現で作り直す"
+                      className="flex items-center gap-1.5 rounded-full px-2 py-1 text-xs text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-zinc-800 dark:hover:text-zinc-300"
+                    >
+                      <RefreshCw
+                        size={13}
+                        className={regenIdx === i ? "animate-spin" : ""}
+                      />
+                      {regenIdx === i ? "再生成中…" : "回答を再生成"}
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -503,6 +595,7 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
 
 function iterIcon(it: LoopIter): LucideIcon {
   if (it.status === "error") return AlertTriangle;
+  if (it.regen) return RefreshCw;
   if (it.kind === "answer") return Check;
   if (it.tool === "fetch_page") return FileText;
   if (it.tool === "web_search") return Search;
@@ -526,18 +619,20 @@ function IterBadge({ it }: { it: LoopIter }) {
       : it.status === "error"
         ? "border-red-500 bg-red-500 text-white"
         : "border-emerald-500 bg-emerald-500 text-white";
+  const spin = it.regen && it.status === "running" ? "animate-spin" : "";
   return (
     <span
       className={`flex h-9 w-9 items-center justify-center rounded-full border-2 ${cls}`}
     >
-      <Icon size={17} strokeWidth={2.2} />
+      <Icon size={17} strokeWidth={2.2} className={spin} />
     </span>
   );
 }
 
 function IterCard({ it }: { it: LoopIter }) {
-  const title =
-    it.kind === "answer"
+  const title = it.regen
+    ? "回答を再生成（ツールは再実行しない）"
+    : it.kind === "answer"
       ? "最終回答を生成"
       : it.tool
         ? TOOL_TITLE[it.tool]
@@ -546,8 +641,15 @@ function IterCard({ it }: { it: LoopIter }) {
   return (
     <div className="min-w-0 pb-4 pt-1">
       <div className="flex items-center gap-2">
-        <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
-          ループ #{it.n}
+        <span
+          className={[
+            "rounded-full px-2 py-0.5 text-xs font-medium",
+            it.regen
+              ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
+              : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300",
+          ].join(" ")}
+        >
+          {it.regen ? "再生成" : `ループ #${it.n}`}
         </span>
         <span
           className={[

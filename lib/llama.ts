@@ -118,6 +118,7 @@ export function parseToolCall(text: string): ToolCall | null {
 
 export async function chatCompletion(
   messages: ChatMessage[],
+  temperature = 0.3,
 ): Promise<string> {
   const res = await fetch(`${LLAMA_BASE_URL}/chat/completions`, {
     method: "POST",
@@ -125,7 +126,7 @@ export async function chatCompletion(
     body: JSON.stringify({
       model: LLAMA_MODEL,
       messages,
-      temperature: 0.3,
+      temperature,
       stream: false,
     }),
   });
