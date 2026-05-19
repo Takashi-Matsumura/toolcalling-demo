@@ -8,16 +8,13 @@ import {
   Brain,
   Check,
   FileText,
-  Globe,
-  Reply,
-  RotateCcw,
+  Search,
   Trash2,
-  Wrench,
   type LucideIcon,
 } from "lucide-react";
 
 // Tool calling の各段をチャットに表示しつつ、横のワークフロー図で
-// web_search / fetch_page の Step 実行をライブに可視化する。
+// 各ループ(LLM 推論→ツール)の履歴を積み上げて可視化する。
 
 type Step =
   | { type: "llm_raw"; content: string }
@@ -45,24 +42,32 @@ type Turn = {
   answer: string;
 };
 
-type WorkflowState = {
+// 1ループ分の記録。これを配列で積むことで履歴を見せる。
+type LoopIter = {
+  n: number;
+  kind: "pending" | "tool" | "answer";
   phase: Phase | null;
-  iter: number;
   tool: "web_search" | "fetch_page" | null;
   arg: string;
   resultCount: number | null;
   fetchChars: number | null;
+  fetchOk: boolean | null;
+  status: "running" | "done" | "error";
+};
+
+type WorkflowState = {
+  iters: LoopIter[];
   status: "idle" | "running" | "error" | "done";
 };
 
-const IDLE_WF: WorkflowState = {
-  phase: null,
-  iter: 0,
-  tool: null,
-  arg: "",
-  resultCount: null,
-  fetchChars: null,
-  status: "idle",
+const IDLE_WF: WorkflowState = { iters: [], status: "idle" };
+
+const PHASE_LABEL: Record<Phase, string> = {
+  llm: "LLM 推論中…",
+  tool_call: "ツール呼び出しを生成…",
+  tool_exec: "ツール実行中…",
+  feedback: "結果を会話へ反映…",
+  final: "最終回答を生成…",
 };
 
 export default function Home() {
@@ -77,6 +82,17 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [turns, live, loading]);
 
+  // 直近(=実行中)のループを書き換えるヘルパー。
+  function patchLast(
+    w: WorkflowState,
+    fn: (it: LoopIter) => LoopIter,
+  ): WorkflowState {
+    if (w.iters.length === 0) return w;
+    const iters = w.iters.slice();
+    iters[iters.length - 1] = fn(iters[iters.length - 1]);
+    return { ...w, iters };
+  }
+
   async function send() {
     const text = input.trim();
     if (!text || loading) return;
@@ -90,7 +106,7 @@ export default function Home() {
 
     const liveTurn: Turn = { user: text, steps: [], answer: "" };
     setLive({ ...liveTurn });
-    setWf({ ...IDLE_WF, status: "running" });
+    setWf({ iters: [], status: "running" });
 
     try {
       const res = await fetch("/api/chat", {
@@ -119,28 +135,77 @@ export default function Home() {
           const ev = JSON.parse(line.slice(5).trim()) as StreamEvent;
 
           if (ev.kind === "phase") {
-            setWf((w) => ({
-              ...w,
-              phase: ev.phase,
-              iter: ev.iter,
-              status: "running",
-            }));
+            setWf((w) => {
+              const last = w.iters[w.iters.length - 1];
+              if (!last || last.n !== ev.iter) {
+                // 新しいループの開始: 前ループを done にして新規追加
+                const iters = w.iters.map((it) =>
+                  it.status === "running"
+                    ? { ...it, status: "done" as const }
+                    : it,
+                );
+                iters.push({
+                  n: ev.iter,
+                  kind: ev.phase === "final" ? "answer" : "pending",
+                  phase: ev.phase,
+                  tool: null,
+                  arg: "",
+                  resultCount: null,
+                  fetchChars: null,
+                  fetchOk: null,
+                  status: "running",
+                });
+                return { ...w, iters };
+              }
+              // 同一ループ内のフェーズ更新
+              return patchLast(w, (it) => ({
+                ...it,
+                phase: ev.phase,
+                kind:
+                  ev.phase === "final"
+                    ? "answer"
+                    : ev.phase === "tool_call"
+                      ? "tool"
+                      : it.kind,
+              }));
+            });
           } else if (ev.kind === "step") {
             const step = ev.step;
             liveTurn.steps = [...liveTurn.steps, step];
             setLive({ ...liveTurn });
             if (step.type === "tool_call") {
-              setWf((w) => ({ ...w, tool: step.tool, arg: step.arg }));
+              setWf((w) =>
+                patchLast(w, (it) => ({
+                  ...it,
+                  kind: "tool",
+                  tool: step.tool,
+                  arg: step.arg,
+                })),
+              );
             } else if (step.type === "search_result") {
-              setWf((w) => ({ ...w, resultCount: step.results.length }));
+              setWf((w) =>
+                patchLast(w, (it) => ({
+                  ...it,
+                  resultCount: step.results.length,
+                })),
+              );
             } else if (step.type === "fetch_result") {
-              setWf((w) => ({
-                ...w,
-                fetchChars: step.chars,
-                status: step.ok ? w.status : "error",
-              }));
+              setWf((w) => {
+                const patched = patchLast(w, (it) => ({
+                  ...it,
+                  fetchChars: step.chars,
+                  fetchOk: step.ok,
+                  status: step.ok ? it.status : ("error" as const),
+                }));
+                return step.ok
+                  ? patched
+                  : { ...patched, status: "error" as const };
+              });
             } else if (step.type === "error") {
-              setWf((w) => ({ ...w, status: "error" }));
+              setWf((w) => ({
+                ...patchLast(w, (it) => ({ ...it, status: "error" })),
+                status: "error",
+              }));
             }
           } else if (ev.kind === "answer") {
             liveTurn.answer = ev.answer;
@@ -149,9 +214,12 @@ export default function Home() {
             setTurns((prev) => [...prev, { ...liveTurn }]);
             setLive(null);
             setWf((w) => ({
-              ...w,
-              phase: null,
               status: w.status === "error" ? "error" : "done",
+              iters: w.iters.map((it) =>
+                it.status === "running"
+                  ? { ...it, status: "done" as const }
+                  : it,
+              ),
             }));
           }
         }
@@ -163,7 +231,7 @@ export default function Home() {
       ];
       setTurns((prev) => [...prev, { ...liveTurn }]);
       setLive(null);
-      setWf((w) => ({ ...w, status: "error", phase: null }));
+      setWf((w) => ({ ...w, status: "error" }));
     } finally {
       setLoading(false);
     }
@@ -208,7 +276,7 @@ export default function Home() {
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">
               fetch_page
             </code>{" "}
-            ツール。右のワークフロー図で Step 実行をライブ表示します。
+            ツール。右にツール実行ループの履歴を表示します。
           </p>
         </header>
 
@@ -258,7 +326,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* 右: ワークフロー可視化 */}
+      {/* 右: ループ履歴の可視化 */}
       <aside className="hidden w-80 shrink-0 overflow-y-auto py-6 lg:block">
         <WorkflowPanel wf={wf} />
       </aside>
@@ -266,49 +334,14 @@ export default function Home() {
   );
 }
 
-const PHASES: { id: Phase; label: string; desc: string; icon: LucideIcon }[] = [
-  { id: "llm", label: "LLM 推論", desc: "ツールを使うか判断", icon: Brain },
-  {
-    id: "tool_call",
-    label: "ツール呼び出し",
-    desc: "web_search / fetch_page を要求",
-    icon: Wrench,
-  },
-  {
-    id: "tool_exec",
-    label: "ツール実行",
-    desc: "検索 or ページ本文取得",
-    icon: Globe,
-  },
-  {
-    id: "feedback",
-    label: "結果を会話へ反映",
-    desc: "整形して LLM に戻す",
-    icon: Reply,
-  },
-  { id: "final", label: "最終回答", desc: "回答を生成", icon: Check },
-];
-
 function WorkflowPanel({ wf }: { wf: WorkflowState }) {
-  const activeIdx = wf.phase ? PHASES.findIndex((p) => p.id === wf.phase) : -1;
-
-  function nodeStatus(idx: number): "idle" | "active" | "done" | "error" {
-    if (wf.status === "error" && idx === activeIdx) return "error";
-    if (wf.status === "idle") return "idle";
-    if (wf.status === "done") return "done";
-    if (activeIdx === -1) return "idle";
-    if (idx < activeIdx) return "done";
-    if (idx === activeIdx) return "active";
-    return "idle";
-  }
-
   return (
     <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
       <div className="mb-1 flex items-center justify-between">
-        <h2 className="font-semibold">ツールワークフロー</h2>
-        {wf.iter > 0 && (
+        <h2 className="font-semibold">ツール実行ループ履歴</h2>
+        {wf.iters.length > 0 && (
           <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950 dark:text-blue-300">
-            ループ #{wf.iter}
+            {wf.iters.length} ループ
           </span>
         )}
       </div>
@@ -322,92 +355,122 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
               : "メッセージ送信で開始"}
       </p>
 
-      <ol className="relative flex flex-col gap-1">
-        {PHASES.map((p, idx) => {
-          const st = nodeStatus(idx);
-          const Icon =
-            st === "done" ? Check : st === "error" ? AlertTriangle : p.icon;
-          return (
-            <li key={p.id} className="flex gap-3">
+      {wf.iters.length === 0 ? (
+        <p className="rounded-lg bg-zinc-50 p-3 text-xs text-zinc-500 dark:bg-zinc-900">
+          各ループで LLM が web_search / fetch_page
+          を呼んだ履歴がここに順番に積み上がります。
+        </p>
+      ) : (
+        <ol className="flex flex-col">
+          {wf.iters.map((it, idx) => (
+            <li key={it.n} className="flex gap-3">
               <div className="flex flex-col items-center">
-                <span
-                  className={[
-                    "flex h-9 w-9 items-center justify-center rounded-full border-2 transition-colors",
-                    st === "active"
-                      ? "animate-pulse border-blue-500 bg-blue-500 text-white"
-                      : st === "done"
-                        ? "border-emerald-500 bg-emerald-500 text-white"
-                        : st === "error"
-                          ? "border-red-500 bg-red-500 text-white"
-                          : "border-zinc-300 bg-transparent text-zinc-400 dark:border-zinc-700",
-                  ].join(" ")}
-                >
-                  <Icon size={18} strokeWidth={2.2} />
-                </span>
-                {idx < PHASES.length - 1 && (
+                <IterBadge it={it} />
+                {idx < wf.iters.length - 1 && (
                   <span
-                    className={[
-                      "my-1 w-0.5 flex-1 transition-colors",
-                      idx < activeIdx || wf.status === "done"
-                        ? "bg-emerald-500"
-                        : "bg-zinc-200 dark:bg-zinc-700",
-                    ].join(" ")}
-                    style={{ minHeight: "1.5rem" }}
+                    className="my-1 w-0.5 flex-1 bg-zinc-200 dark:bg-zinc-700"
+                    style={{ minHeight: "1.25rem" }}
                   />
                 )}
               </div>
-
-              <div className="pb-3 pt-1">
-                <div
-                  className={[
-                    "text-sm font-medium",
-                    st === "active"
-                      ? "text-blue-600 dark:text-blue-400"
-                      : st === "idle"
-                        ? "text-zinc-400"
-                        : "",
-                  ].join(" ")}
-                >
-                  {p.id === "tool_exec" && wf.tool === "fetch_page"
-                    ? "ページ本文取得"
-                    : p.id === "tool_exec" && wf.tool === "web_search"
-                      ? "SearXNG 検索"
-                      : p.label}
-                </div>
-                <div className="text-xs text-zinc-500">{p.desc}</div>
-
-                {p.id === "tool_call" && wf.tool && wf.arg && (
-                  <div className="mt-1 truncate rounded bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-950 dark:text-amber-300">
-                    {wf.tool}: {wf.arg}
-                  </div>
-                )}
-                {p.id === "tool_exec" &&
-                  wf.tool === "web_search" &&
-                  wf.resultCount !== null && (
-                    <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-                      {wf.resultCount} 件取得
-                    </div>
-                  )}
-                {p.id === "tool_exec" &&
-                  wf.tool === "fetch_page" &&
-                  wf.fetchChars !== null && (
-                    <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-                      本文 {wf.fetchChars} 文字抽出
-                    </div>
-                  )}
-              </div>
+              <IterCard it={it} />
             </li>
-          );
-        })}
-      </ol>
+          ))}
+        </ol>
+      )}
 
-      <div className="mt-2 flex items-start gap-2 rounded-lg bg-zinc-50 p-2 text-xs text-zinc-500 dark:bg-zinc-900">
-        <RotateCcw size={14} className="mt-0.5 shrink-0" />
-        <span>
-          検索 → 本文取得 → 回答、のように LLM がツールを繰り返し要求すると
-          LLM 推論へ戻りループします（最大 5 回）。
+      <div className="mt-3 rounded-lg bg-zinc-50 p-2 text-xs text-zinc-500 dark:bg-zinc-900">
+        LLM がツールを繰り返し要求するたびに新しいループが追加されます
+        （最大 5 回）。検索 → 本文取得 → 回答、のように連鎖します。
+      </div>
+    </div>
+  );
+}
+
+function iterIcon(it: LoopIter): LucideIcon {
+  if (it.status === "error") return AlertTriangle;
+  if (it.kind === "answer") return Check;
+  if (it.tool === "fetch_page") return FileText;
+  if (it.tool === "web_search") return Search;
+  return Brain;
+}
+
+function IterBadge({ it }: { it: LoopIter }) {
+  const Icon = iterIcon(it);
+  const cls =
+    it.status === "running"
+      ? "animate-pulse border-blue-500 bg-blue-500 text-white"
+      : it.status === "error"
+        ? "border-red-500 bg-red-500 text-white"
+        : "border-emerald-500 bg-emerald-500 text-white";
+  return (
+    <span
+      className={`flex h-9 w-9 items-center justify-center rounded-full border-2 ${cls}`}
+    >
+      <Icon size={17} strokeWidth={2.2} />
+    </span>
+  );
+}
+
+function IterCard({ it }: { it: LoopIter }) {
+  const title =
+    it.kind === "answer"
+      ? "最終回答を生成"
+      : it.tool === "web_search"
+        ? "web_search で検索"
+        : it.tool === "fetch_page"
+          ? "fetch_page で本文取得"
+          : "LLM 推論";
+
+  return (
+    <div className="min-w-0 pb-4 pt-1">
+      <div className="flex items-center gap-2">
+        <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+          ループ #{it.n}
+        </span>
+        <span
+          className={[
+            "text-sm font-medium",
+            it.status === "running" ? "text-blue-600 dark:text-blue-400" : "",
+            it.status === "error" ? "text-red-600 dark:text-red-400" : "",
+          ].join(" ")}
+        >
+          {title}
         </span>
       </div>
+
+      {it.tool && it.arg && (
+        <div className="mt-1 truncate rounded bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+          {it.tool}: {it.arg}
+        </div>
+      )}
+
+      {it.resultCount !== null && (
+        <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+          検索結果 {it.resultCount} 件取得
+        </div>
+      )}
+
+      {it.fetchChars !== null && (
+        <div
+          className={[
+            "mt-1 rounded px-2 py-1 text-xs",
+            it.fetchOk
+              ? "bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300"
+              : "bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-400",
+          ].join(" ")}
+        >
+          {it.fetchOk
+            ? `本文 ${it.fetchChars} 文字抽出`
+            : "本文取得に失敗"}
+        </div>
+      )}
+
+      {it.status === "running" && it.phase && (
+        <div className="mt-1 text-xs text-blue-600 dark:text-blue-400">
+          {PHASE_LABEL[it.phase]}
+        </div>
+      )}
     </div>
   );
 }
@@ -428,7 +491,7 @@ function StepView({ step }: { step: Step }) {
     const isFetch = step.tool === "fetch_page";
     return (
       <div className="flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-700 dark:bg-amber-950">
-        {isFetch ? <FileText size={15} /> : <Wrench size={15} />}
+        {isFetch ? <FileText size={15} /> : <Search size={15} />}
         <span>
           <strong>{step.tool}</strong> を呼び出し: <code>{step.arg}</code>
         </span>
