@@ -6,24 +6,50 @@ import {
 } from "@/lib/llama";
 import { formatResultsForModel, webSearch } from "@/lib/web-search";
 import { fetchPage } from "@/lib/fetch-page";
+import { arxivSearch, formatArxivForModel } from "@/lib/arxiv";
+import { githubSearch, formatGithubForModel } from "@/lib/github";
 
 // Tool calling のループ本体を SSE でストリーミングする。
-// web_search / fetch_page の2ツールに対応。
+// web_search / fetch_page / arxiv / github の4ツールに対応。
 // 各段の開始(phase)と結果(step)をリアルタイムに送出する。
 
 export const dynamic = "force-dynamic";
 
-const MAX_STEPS = 5; // 無限ループ防止 (search→fetch→answer に余裕を持たせる)
+const MAX_STEPS = 6; // 無限ループ防止 (検索→専門検索→精読→回答に余裕)
+
+type ToolName = "web_search" | "fetch_page" | "arxiv" | "github";
 
 type Step =
   | { type: "llm_raw"; content: string }
-  | { type: "tool_call"; tool: "web_search" | "fetch_page"; arg: string }
+  | { type: "tool_call"; tool: ToolName; arg: string }
   | {
       type: "search_result";
       query: string;
       results: { title: string; url: string; snippet: string }[];
     }
   | { type: "fetch_result"; url: string; ok: boolean; chars: number }
+  | {
+      type: "arxiv_result";
+      query: string;
+      papers: {
+        title: string;
+        authors: string[];
+        year: string;
+        summary: string;
+        url: string;
+      }[];
+    }
+  | {
+      type: "github_result";
+      query: string;
+      repos: {
+        fullName: string;
+        description: string;
+        stars: number;
+        language: string;
+        url: string;
+      }[];
+    }
   | { type: "final"; text: string }
   | { type: "error"; message: string };
 
@@ -112,8 +138,7 @@ export async function POST(request: Request) {
                 `適切な URL に fetch_page を使って本文を読んでください。` +
                 `概要だけで十分なら日本語で最終回答してください。`,
             });
-          } else {
-            // fetch_page
+          } else if (toolCall.tool === "fetch_page") {
             send({
               kind: "step",
               step: {
@@ -145,6 +170,63 @@ export async function POST(request: Request) {
                 `\n\nこの本文を根拠に、ユーザーの質問へ具体的に日本語で` +
                 `答えてください。本文に答えが無ければ別の URL を` +
                 `fetch_page するか web_search し直してください。`,
+            });
+          } else if (toolCall.tool === "arxiv") {
+            send({
+              kind: "step",
+              step: { type: "tool_call", tool: "arxiv", arg: toolCall.query },
+            });
+
+            send({ kind: "phase", phase: "tool_exec", iter });
+            const papers = await arxivSearch(toolCall.query);
+            send({
+              kind: "step",
+              step: {
+                type: "arxiv_result",
+                query: toolCall.query,
+                papers,
+              },
+            });
+
+            send({ kind: "phase", phase: "feedback", iter });
+            convo.push({ role: "assistant", content: raw });
+            convo.push({
+              role: "user",
+              content:
+                `arxiv("${toolCall.query}") の結果:\n\n` +
+                formatArxivForModel(papers) +
+                `\n\n論文の主旨を詳しく述べる必要があれば、その abs URL を` +
+                ` fetch_page で精読してください。要点を踏まえて日本語で` +
+                `具体的に回答してください。`,
+            });
+          } else {
+            // github
+            send({
+              kind: "step",
+              step: { type: "tool_call", tool: "github", arg: toolCall.query },
+            });
+
+            send({ kind: "phase", phase: "tool_exec", iter });
+            const repos = await githubSearch(toolCall.query);
+            send({
+              kind: "step",
+              step: {
+                type: "github_result",
+                query: toolCall.query,
+                repos,
+              },
+            });
+
+            send({ kind: "phase", phase: "feedback", iter });
+            convo.push({ role: "assistant", content: raw });
+            convo.push({
+              role: "user",
+              content:
+                `github("${toolCall.query}") の結果:\n\n` +
+                formatGithubForModel(repos) +
+                `\n\n各リポジトリの特徴を詳しく述べる必要があれば、その` +
+                ` URL を fetch_page で README を精読してください。` +
+                `要点を踏まえて日本語で具体的に回答してください。`,
             });
           }
         }
