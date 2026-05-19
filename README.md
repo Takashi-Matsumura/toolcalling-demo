@@ -15,7 +15,7 @@
                │    モデルが {"tool":"<name>","query|url":"..."} を出力
                ├─ web_search: SearXNG ?format=json を fetch (上位5件)
                ├─ fetch_page: URL を取得し本文テキストを抽出(最大4000字)
-               ├─ arxiv     : arXiv API(Atom) を検索し論文要点を整形(上位5件)
+               ├─ arxiv     : arXiv API(Atom)。429/失敗時は OpenAlex に自動代替
                ├─ github    : GitHub リポジトリ検索(★順 上位5件)
                └─ 結果を会話に戻し最終回答までループ(最大6段)
 ```

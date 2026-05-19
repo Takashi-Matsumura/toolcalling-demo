@@ -38,6 +38,7 @@ type Step =
         year: string;
         summary: string;
         url: string;
+        source: "arxiv" | "openalex";
       }[];
     }
   | {
@@ -98,6 +99,40 @@ const PHASE_LABEL: Record<Phase, string> = {
   final: "最終回答を生成…",
 };
 
+// 初期画面で提示する検証用サンプル。各ツール/連鎖を網羅する。
+const SAMPLE_PROMPTS: { prompt: string; hint: string; icon: LucideIcon }[] = [
+  {
+    prompt: "Next.js 16 の新機能を3つ教えて",
+    hint: "web_search",
+    icon: Search,
+  },
+  {
+    prompt: "東京の今日の天気を教えて",
+    hint: "web_search → fetch_page 連鎖",
+    icon: FileText,
+  },
+  {
+    prompt: "Transformer の代表的な論文を教えて",
+    hint: "arxiv",
+    icon: GraduationCap,
+  },
+  {
+    prompt: "ローカルLLMを動かせる人気OSSをスター数順で",
+    hint: "github",
+    icon: Code2,
+  },
+  {
+    prompt: "LoRA の元論文を探して要点を3行で説明して",
+    hint: "arxiv → fetch_page 連鎖",
+    icon: GraduationCap,
+  },
+  {
+    prompt: "ReAct は論文の手法？それともライブラリ？両方調べて",
+    hint: "arxiv / github 使い分け",
+    icon: Code2,
+  },
+];
+
 export default function Home() {
   const [input, setInput] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -121,8 +156,8 @@ export default function Home() {
     return { ...w, iters };
   }
 
-  async function send() {
-    const text = input.trim();
+  async function send(prompt?: string) {
+    const text = (prompt ?? input).trim();
     if (!text || loading) return;
     setInput("");
     setLoading(true);
@@ -333,6 +368,33 @@ export default function Home() {
         </header>
 
         <div className="flex flex-1 flex-col gap-8 overflow-y-auto pb-6">
+          {allTurns.length === 0 && !loading && (
+            <div className="flex flex-1 flex-col items-center justify-center gap-4">
+              <p className="text-sm text-zinc-500">
+                サンプルを選ぶか、下の入力欄から質問してください
+              </p>
+              <div className="grid w-full max-w-xl grid-cols-1 gap-2 sm:grid-cols-2">
+                {SAMPLE_PROMPTS.map((s) => (
+                  <button
+                    key={s.prompt}
+                    onClick={() => send(s.prompt)}
+                    className="flex items-start gap-2 rounded-xl border border-zinc-200 p-3 text-left transition-colors hover:border-blue-400 hover:bg-blue-50 dark:border-zinc-700 dark:hover:border-blue-600 dark:hover:bg-blue-950"
+                  >
+                    <s.icon
+                      size={16}
+                      className="mt-0.5 shrink-0 text-blue-600 dark:text-blue-400"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm">{s.prompt}</span>
+                      <span className="mt-0.5 block text-xs text-zinc-500">
+                        {s.hint}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {allTurns.map((t, i) => (
             <div key={i} className="flex flex-col gap-3">
               <div className="self-end rounded-2xl bg-blue-600 px-4 py-2 text-white">
@@ -370,7 +432,7 @@ export default function Home() {
           />
           <button
             className="rounded-full bg-blue-600 px-5 py-2 font-medium text-white disabled:opacity-50"
-            onClick={send}
+            onClick={() => send()}
             disabled={loading}
           >
             送信
@@ -607,6 +669,13 @@ function StepView({ step }: { step: Step }) {
       <div className="rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-sm dark:border-indigo-700 dark:bg-indigo-950">
         <div className="mb-2 flex items-center gap-1.5 text-indigo-700 dark:text-indigo-300">
           <GraduationCap size={15} /> 論文 {step.papers.length} 件
+          {step.papers[0] && (
+            <span className="rounded bg-indigo-100 px-1.5 text-xs font-normal dark:bg-indigo-900">
+              {step.papers[0].source === "openalex"
+                ? "OpenAlex (arXiv 制限時の代替)"
+                : "arXiv"}
+            </span>
+          )}
         </div>
         <ul className="flex flex-col gap-2">
           {step.papers.map((p, i) => (

@@ -37,6 +37,7 @@ type Step =
         year: string;
         summary: string;
         url: string;
+        source: "arxiv" | "openalex";
       }[];
     }
   | {
