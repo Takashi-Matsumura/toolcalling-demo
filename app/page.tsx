@@ -7,7 +7,9 @@ import {
   AlertTriangle,
   Brain,
   Check,
+  Code2,
   FileText,
+  GraduationCap,
   Search,
   Trash2,
   type LucideIcon,
@@ -16,15 +18,40 @@ import {
 // Tool calling の各段をチャットに表示しつつ、横のワークフロー図で
 // 各ループ(LLM 推論→ツール)の履歴を積み上げて可視化する。
 
+type ToolName = "web_search" | "fetch_page" | "arxiv" | "github";
+
 type Step =
   | { type: "llm_raw"; content: string }
-  | { type: "tool_call"; tool: "web_search" | "fetch_page"; arg: string }
+  | { type: "tool_call"; tool: ToolName; arg: string }
   | {
       type: "search_result";
       query: string;
       results: { title: string; url: string; snippet: string }[];
     }
   | { type: "fetch_result"; url: string; ok: boolean; chars: number }
+  | {
+      type: "arxiv_result";
+      query: string;
+      papers: {
+        title: string;
+        authors: string[];
+        year: string;
+        summary: string;
+        url: string;
+        source: "arxiv" | "openalex";
+      }[];
+    }
+  | {
+      type: "github_result";
+      query: string;
+      repos: {
+        fullName: string;
+        description: string;
+        stars: number;
+        language: string;
+        url: string;
+      }[];
+    }
   | { type: "final"; text: string }
   | { type: "error"; message: string };
 
@@ -47,11 +74,13 @@ type LoopIter = {
   n: number;
   kind: "pending" | "tool" | "answer";
   phase: Phase | null;
-  tool: "web_search" | "fetch_page" | null;
+  tool: ToolName | null;
   arg: string;
   resultCount: number | null;
   fetchChars: number | null;
   fetchOk: boolean | null;
+  paperCount: number | null;
+  repoCount: number | null;
   status: "running" | "done" | "error";
 };
 
@@ -69,6 +98,40 @@ const PHASE_LABEL: Record<Phase, string> = {
   feedback: "結果を会話へ反映…",
   final: "最終回答を生成…",
 };
+
+// 初期画面で提示する検証用サンプル。各ツール/連鎖を網羅する。
+const SAMPLE_PROMPTS: { prompt: string; hint: string; icon: LucideIcon }[] = [
+  {
+    prompt: "Next.js 16 の新機能を3つ教えて",
+    hint: "web_search",
+    icon: Search,
+  },
+  {
+    prompt: "東京の今日の天気を教えて",
+    hint: "web_search → fetch_page 連鎖",
+    icon: FileText,
+  },
+  {
+    prompt: "Transformer の代表的な論文を教えて",
+    hint: "arxiv",
+    icon: GraduationCap,
+  },
+  {
+    prompt: "ローカルLLMを動かせる人気OSSをスター数順で",
+    hint: "github",
+    icon: Code2,
+  },
+  {
+    prompt: "LoRA の元論文を探して要点を3行で説明して",
+    hint: "arxiv → fetch_page 連鎖",
+    icon: GraduationCap,
+  },
+  {
+    prompt: "ReAct は論文の手法？それともライブラリ？両方調べて",
+    hint: "arxiv / github 使い分け",
+    icon: Code2,
+  },
+];
 
 export default function Home() {
   const [input, setInput] = useState("");
@@ -93,8 +156,8 @@ export default function Home() {
     return { ...w, iters };
   }
 
-  async function send() {
-    const text = input.trim();
+  async function send(prompt?: string) {
+    const text = (prompt ?? input).trim();
     if (!text || loading) return;
     setInput("");
     setLoading(true);
@@ -153,6 +216,8 @@ export default function Home() {
                   resultCount: null,
                   fetchChars: null,
                   fetchOk: null,
+                  paperCount: null,
+                  repoCount: null,
                   status: "running",
                 });
                 return { ...w, iters };
@@ -187,6 +252,20 @@ export default function Home() {
                 patchLast(w, (it) => ({
                   ...it,
                   resultCount: step.results.length,
+                })),
+              );
+            } else if (step.type === "arxiv_result") {
+              setWf((w) =>
+                patchLast(w, (it) => ({
+                  ...it,
+                  paperCount: step.papers.length,
+                })),
+              );
+            } else if (step.type === "github_result") {
+              setWf((w) =>
+                patchLast(w, (it) => ({
+                  ...it,
+                  repoCount: step.repos.length,
                 })),
               );
             } else if (step.type === "fetch_result") {
@@ -276,11 +355,46 @@ export default function Home() {
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">
               fetch_page
             </code>{" "}
+            /{" "}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">
+              arxiv
+            </code>{" "}
+            /{" "}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">
+              github
+            </code>{" "}
             ツール。右にツール実行ループの履歴を表示します。
           </p>
         </header>
 
         <div className="flex flex-1 flex-col gap-8 overflow-y-auto pb-6">
+          {allTurns.length === 0 && !loading && (
+            <div className="flex flex-1 flex-col items-center justify-center gap-4">
+              <p className="text-sm text-zinc-500">
+                サンプルを選ぶか、下の入力欄から質問してください
+              </p>
+              <div className="grid w-full max-w-xl grid-cols-1 gap-2 sm:grid-cols-2">
+                {SAMPLE_PROMPTS.map((s) => (
+                  <button
+                    key={s.prompt}
+                    onClick={() => send(s.prompt)}
+                    className="flex items-start gap-2 rounded-xl border border-zinc-200 p-3 text-left transition-colors hover:border-blue-400 hover:bg-blue-50 dark:border-zinc-700 dark:hover:border-blue-600 dark:hover:bg-blue-950"
+                  >
+                    <s.icon
+                      size={16}
+                      className="mt-0.5 shrink-0 text-blue-600 dark:text-blue-400"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm">{s.prompt}</span>
+                      <span className="mt-0.5 block text-xs text-zinc-500">
+                        {s.hint}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {allTurns.map((t, i) => (
             <div key={i} className="flex flex-col gap-3">
               <div className="self-end rounded-2xl bg-blue-600 px-4 py-2 text-white">
@@ -318,7 +432,7 @@ export default function Home() {
           />
           <button
             className="rounded-full bg-blue-600 px-5 py-2 font-medium text-white disabled:opacity-50"
-            onClick={send}
+            onClick={() => send()}
             disabled={loading}
           >
             送信
@@ -357,7 +471,7 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
 
       {wf.iters.length === 0 ? (
         <p className="rounded-lg bg-zinc-50 p-3 text-xs text-zinc-500 dark:bg-zinc-900">
-          各ループで LLM が web_search / fetch_page
+          各ループで LLM が web_search / fetch_page / arxiv / github
           を呼んだ履歴がここに順番に積み上がります。
         </p>
       ) : (
@@ -381,7 +495,7 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
 
       <div className="mt-3 rounded-lg bg-zinc-50 p-2 text-xs text-zinc-500 dark:bg-zinc-900">
         LLM がツールを繰り返し要求するたびに新しいループが追加されます
-        （最大 5 回）。検索 → 本文取得 → 回答、のように連鎖します。
+        （最大 6 回）。検索 → 専門検索 → 本文精読 → 回答、のように連鎖します。
       </div>
     </div>
   );
@@ -392,8 +506,17 @@ function iterIcon(it: LoopIter): LucideIcon {
   if (it.kind === "answer") return Check;
   if (it.tool === "fetch_page") return FileText;
   if (it.tool === "web_search") return Search;
+  if (it.tool === "arxiv") return GraduationCap;
+  if (it.tool === "github") return Code2;
   return Brain;
 }
+
+const TOOL_TITLE: Record<ToolName, string> = {
+  web_search: "web_search で検索",
+  fetch_page: "fetch_page で本文取得",
+  arxiv: "arxiv で論文検索",
+  github: "github でリポジトリ検索",
+};
 
 function IterBadge({ it }: { it: LoopIter }) {
   const Icon = iterIcon(it);
@@ -416,11 +539,9 @@ function IterCard({ it }: { it: LoopIter }) {
   const title =
     it.kind === "answer"
       ? "最終回答を生成"
-      : it.tool === "web_search"
-        ? "web_search で検索"
-        : it.tool === "fetch_page"
-          ? "fetch_page で本文取得"
-          : "LLM 推論";
+      : it.tool
+        ? TOOL_TITLE[it.tool]
+        : "LLM 推論";
 
   return (
     <div className="min-w-0 pb-4 pt-1">
@@ -448,6 +569,18 @@ function IterCard({ it }: { it: LoopIter }) {
       {it.resultCount !== null && (
         <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
           検索結果 {it.resultCount} 件取得
+        </div>
+      )}
+
+      {it.paperCount !== null && (
+        <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+          論文 {it.paperCount} 件取得
+        </div>
+      )}
+
+      {it.repoCount !== null && (
+        <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+          リポジトリ {it.repoCount} 件取得
         </div>
       )}
 
@@ -488,10 +621,17 @@ function StepView({ step }: { step: Step }) {
   }
 
   if (step.type === "tool_call") {
-    const isFetch = step.tool === "fetch_page";
+    const Icon =
+      step.tool === "fetch_page"
+        ? FileText
+        : step.tool === "arxiv"
+          ? GraduationCap
+          : step.tool === "github"
+            ? Code2
+            : Search;
     return (
       <div className="flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-700 dark:bg-amber-950">
-        {isFetch ? <FileText size={15} /> : <Search size={15} />}
+        <Icon size={15} />
         <span>
           <strong>{step.tool}</strong> を呼び出し: <code>{step.arg}</code>
         </span>
@@ -517,6 +657,72 @@ function StepView({ step }: { step: Step }) {
                 {r.title}
               </a>
               <p className="text-xs text-zinc-500">{r.snippet}</p>
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  }
+
+  if (step.type === "arxiv_result") {
+    return (
+      <div className="rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-2 text-sm dark:border-indigo-700 dark:bg-indigo-950">
+        <div className="mb-2 flex items-center gap-1.5 text-indigo-700 dark:text-indigo-300">
+          <GraduationCap size={15} /> 論文 {step.papers.length} 件
+          {step.papers[0] && (
+            <span className="rounded bg-indigo-100 px-1.5 text-xs font-normal dark:bg-indigo-900">
+              {step.papers[0].source === "openalex"
+                ? "OpenAlex (arXiv 制限時の代替)"
+                : "arXiv"}
+            </span>
+          )}
+        </div>
+        <ul className="flex flex-col gap-2">
+          {step.papers.map((p, i) => (
+            <li key={i}>
+              <a
+                href={p.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-medium text-blue-600 underline"
+              >
+                {p.title}
+              </a>{" "}
+              <span className="text-xs text-zinc-500">({p.year})</span>
+              <p className="text-xs text-zinc-500">
+                {p.authors.slice(0, 3).join(", ")}
+                {p.authors.length > 3 ? " ほか" : ""}
+              </p>
+              <p className="text-xs text-zinc-500">{p.summary}</p>
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  }
+
+  if (step.type === "github_result") {
+    return (
+      <div className="rounded-lg border border-violet-300 bg-violet-50 px-3 py-2 text-sm dark:border-violet-700 dark:bg-violet-950">
+        <div className="mb-2 flex items-center gap-1.5 text-violet-700 dark:text-violet-300">
+          <Code2 size={15} /> リポジトリ {step.repos.length} 件
+        </div>
+        <ul className="flex flex-col gap-2">
+          {step.repos.map((r, i) => (
+            <li key={i}>
+              <a
+                href={r.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-medium text-blue-600 underline"
+              >
+                {r.fullName}
+              </a>{" "}
+              <span className="text-xs text-zinc-500">
+                ★{r.stars.toLocaleString()}
+                {r.language ? ` · ${r.language}` : ""}
+              </span>
+              <p className="text-xs text-zinc-500">{r.description}</p>
             </li>
           ))}
         </ul>
