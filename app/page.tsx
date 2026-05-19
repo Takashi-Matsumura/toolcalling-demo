@@ -10,6 +10,7 @@ import {
   Globe,
   Reply,
   RotateCcw,
+  Trash2,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
@@ -157,16 +158,36 @@ export default function Home() {
     }
   }
 
+  function clearChat() {
+    if (loading) return;
+    setTurns([]);
+    setLive(null);
+    setWf(IDLE_WF);
+    setInput("");
+  }
+
   const allTurns = live ? [...turns, live] : turns;
+  const hasContent = turns.length > 0 || live !== null;
 
   return (
     <main className="mx-auto flex h-screen w-full max-w-6xl gap-6 px-4">
       {/* 左: チャット */}
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="shrink-0 py-6">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Tool Calling Demo
-          </h1>
+          <div className="flex items-start justify-between gap-4">
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Tool Calling Demo
+            </h1>
+            <button
+              onClick={clearChat}
+              disabled={loading || !hasContent}
+              title="チャットをクリア"
+              className="flex shrink-0 items-center gap-1.5 rounded-full border border-zinc-300 px-3 py-1.5 text-sm text-zinc-600 transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+            >
+              <Trash2 size={15} />
+              クリア
+            </button>
+          </div>
           <p className="mt-1 text-sm text-zinc-500">
             ローカル LLM (gemma-4-e4b-it) +{" "}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">
