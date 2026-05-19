@@ -7,6 +7,7 @@ import {
   AlertTriangle,
   Brain,
   Check,
+  FileText,
   Globe,
   Reply,
   RotateCcw,
@@ -16,20 +17,21 @@ import {
 } from "lucide-react";
 
 // Tool calling の各段をチャットに表示しつつ、横のワークフロー図で
-// web_search ツールの Step 実行をライブに可視化する。
+// web_search / fetch_page の Step 実行をライブに可視化する。
 
 type Step =
   | { type: "llm_raw"; content: string }
-  | { type: "tool_call"; query: string }
+  | { type: "tool_call"; tool: "web_search" | "fetch_page"; arg: string }
   | {
-      type: "tool_result";
+      type: "search_result";
       query: string;
       results: { title: string; url: string; snippet: string }[];
     }
+  | { type: "fetch_result"; url: string; ok: boolean; chars: number }
   | { type: "final"; text: string }
   | { type: "error"; message: string };
 
-type Phase = "llm" | "tool_call" | "search" | "feedback" | "final";
+type Phase = "llm" | "tool_call" | "tool_exec" | "feedback" | "final";
 
 type StreamEvent =
   | { kind: "phase"; phase: Phase; iter: number }
@@ -46,16 +48,20 @@ type Turn = {
 type WorkflowState = {
   phase: Phase | null;
   iter: number;
-  query: string;
+  tool: "web_search" | "fetch_page" | null;
+  arg: string;
   resultCount: number | null;
+  fetchChars: number | null;
   status: "idle" | "running" | "error" | "done";
 };
 
 const IDLE_WF: WorkflowState = {
   phase: null,
   iter: 0,
-  query: "",
+  tool: null,
+  arg: "",
   resultCount: null,
+  fetchChars: null,
   status: "idle",
 };
 
@@ -104,7 +110,6 @@ export default function Home() {
         if (done) break;
         buf += decoder.decode(value, { stream: true });
 
-        // SSE は \n\n 区切り。完成したイベントだけ処理する。
         const parts = buf.split("\n\n");
         buf = parts.pop() ?? "";
 
@@ -125,9 +130,15 @@ export default function Home() {
             liveTurn.steps = [...liveTurn.steps, step];
             setLive({ ...liveTurn });
             if (step.type === "tool_call") {
-              setWf((w) => ({ ...w, query: step.query }));
-            } else if (step.type === "tool_result") {
+              setWf((w) => ({ ...w, tool: step.tool, arg: step.arg }));
+            } else if (step.type === "search_result") {
               setWf((w) => ({ ...w, resultCount: step.results.length }));
+            } else if (step.type === "fetch_result") {
+              setWf((w) => ({
+                ...w,
+                fetchChars: step.chars,
+                status: step.ok ? w.status : "error",
+              }));
             } else if (step.type === "error") {
               setWf((w) => ({ ...w, status: "error" }));
             }
@@ -193,6 +204,10 @@ export default function Home() {
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">
               web_search
             </code>{" "}
+            /{" "}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">
+              fetch_page
+            </code>{" "}
             ツール。右のワークフロー図で Step 実行をライブ表示します。
           </p>
         </header>
@@ -218,9 +233,7 @@ export default function Home() {
             </div>
           ))}
 
-          {loading && (
-            <div className="text-sm text-zinc-500">推論中…</div>
-          )}
+          {loading && <div className="text-sm text-zinc-500">推論中…</div>}
           <div ref={bottomRef} />
         </div>
 
@@ -228,7 +241,7 @@ export default function Home() {
           <input
             className="flex-1 rounded-full border border-zinc-300 px-4 py-2 outline-none focus:border-blue-500 dark:border-zinc-700 dark:bg-zinc-900"
             value={input}
-            placeholder="例: Next.js 16 の新機能を調べて"
+            placeholder="例: 沖縄市の今日の天気を教えて"
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.nativeEvent.isComposing) send();
@@ -258,13 +271,13 @@ const PHASES: { id: Phase; label: string; desc: string; icon: LucideIcon }[] = [
   {
     id: "tool_call",
     label: "ツール呼び出し",
-    desc: "web_search(query) を要求",
+    desc: "web_search / fetch_page を要求",
     icon: Wrench,
   },
   {
-    id: "search",
-    label: "SearXNG 検索",
-    desc: "HTTP で検索を実行",
+    id: "tool_exec",
+    label: "ツール実行",
+    desc: "検索 or ページ本文取得",
     icon: Globe,
   },
   {
@@ -277,9 +290,7 @@ const PHASES: { id: Phase; label: string; desc: string; icon: LucideIcon }[] = [
 ];
 
 function WorkflowPanel({ wf }: { wf: WorkflowState }) {
-  const activeIdx = wf.phase
-    ? PHASES.findIndex((p) => p.id === wf.phase)
-    : -1;
+  const activeIdx = wf.phase ? PHASES.findIndex((p) => p.id === wf.phase) : -1;
 
   function nodeStatus(idx: number): "idle" | "active" | "done" | "error" {
     if (wf.status === "error" && idx === activeIdx) return "error";
@@ -294,7 +305,7 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
   return (
     <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
       <div className="mb-1 flex items-center justify-between">
-        <h2 className="font-semibold">web_search ワークフロー</h2>
+        <h2 className="font-semibold">ツールワークフロー</h2>
         {wf.iter > 0 && (
           <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950 dark:text-blue-300">
             ループ #{wf.iter}
@@ -318,11 +329,10 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
             st === "done" ? Check : st === "error" ? AlertTriangle : p.icon;
           return (
             <li key={p.id} className="flex gap-3">
-              {/* ノード + 縦線 */}
               <div className="flex flex-col items-center">
                 <span
                   className={[
-                    "flex h-9 w-9 items-center justify-center rounded-full border-2 text-sm transition-colors",
+                    "flex h-9 w-9 items-center justify-center rounded-full border-2 transition-colors",
                     st === "active"
                       ? "animate-pulse border-blue-500 bg-blue-500 text-white"
                       : st === "done"
@@ -347,7 +357,6 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
                 )}
               </div>
 
-              {/* ラベル */}
               <div className="pb-3 pt-1">
                 <div
                   className={[
@@ -359,20 +368,33 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
                         : "",
                   ].join(" ")}
                 >
-                  {p.label}
+                  {p.id === "tool_exec" && wf.tool === "fetch_page"
+                    ? "ページ本文取得"
+                    : p.id === "tool_exec" && wf.tool === "web_search"
+                      ? "SearXNG 検索"
+                      : p.label}
                 </div>
                 <div className="text-xs text-zinc-500">{p.desc}</div>
 
-                {p.id === "tool_call" && wf.query && (
+                {p.id === "tool_call" && wf.tool && wf.arg && (
                   <div className="mt-1 truncate rounded bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:bg-amber-950 dark:text-amber-300">
-                    query: {wf.query}
+                    {wf.tool}: {wf.arg}
                   </div>
                 )}
-                {p.id === "search" && wf.resultCount !== null && (
-                  <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-                    {wf.resultCount} 件取得
-                  </div>
-                )}
+                {p.id === "tool_exec" &&
+                  wf.tool === "web_search" &&
+                  wf.resultCount !== null && (
+                    <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                      {wf.resultCount} 件取得
+                    </div>
+                  )}
+                {p.id === "tool_exec" &&
+                  wf.tool === "fetch_page" &&
+                  wf.fetchChars !== null && (
+                    <div className="mt-1 rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                      本文 {wf.fetchChars} 文字抽出
+                    </div>
+                  )}
               </div>
             </li>
           );
@@ -382,8 +404,8 @@ function WorkflowPanel({ wf }: { wf: WorkflowState }) {
       <div className="mt-2 flex items-start gap-2 rounded-lg bg-zinc-50 p-2 text-xs text-zinc-500 dark:bg-zinc-900">
         <RotateCcw size={14} className="mt-0.5 shrink-0" />
         <span>
-          「結果を会話へ反映」後、LLM が再度ツールを要求すると LLM
-          推論へ戻りループします（最大 4 回）。
+          検索 → 本文取得 → 回答、のように LLM がツールを繰り返し要求すると
+          LLM 推論へ戻りループします（最大 5 回）。
         </span>
       </div>
     </div>
@@ -403,14 +425,18 @@ function StepView({ step }: { step: Step }) {
   }
 
   if (step.type === "tool_call") {
+    const isFetch = step.tool === "fetch_page";
     return (
-      <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-700 dark:bg-amber-950">
-        🔧 <strong>web_search</strong> を呼び出し: <code>{step.query}</code>
+      <div className="flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-700 dark:bg-amber-950">
+        {isFetch ? <FileText size={15} /> : <Wrench size={15} />}
+        <span>
+          <strong>{step.tool}</strong> を呼び出し: <code>{step.arg}</code>
+        </span>
       </div>
     );
   }
 
-  if (step.type === "tool_result") {
+  if (step.type === "search_result") {
     return (
       <div className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm dark:border-emerald-700 dark:bg-emerald-950">
         <div className="mb-2 text-emerald-700 dark:text-emerald-400">
@@ -431,6 +457,27 @@ function StepView({ step }: { step: Step }) {
             </li>
           ))}
         </ul>
+      </div>
+    );
+  }
+
+  if (step.type === "fetch_result") {
+    return (
+      <div
+        className={[
+          "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm",
+          step.ok
+            ? "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
+            : "border-red-300 bg-red-50 text-red-700 dark:border-red-700 dark:bg-red-950 dark:text-red-400",
+        ].join(" ")}
+      >
+        <FileText size={15} />
+        <span className="min-w-0">
+          {step.ok
+            ? `本文 ${step.chars} 文字を抽出`
+            : "本文を取得できませんでした"}
+          <span className="block truncate text-xs opacity-70">{step.url}</span>
+        </span>
       </div>
     );
   }

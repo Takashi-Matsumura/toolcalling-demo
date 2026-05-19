@@ -5,28 +5,30 @@ import {
   type ChatMessage,
 } from "@/lib/llama";
 import { formatResultsForModel, webSearch } from "@/lib/web-search";
+import { fetchPage } from "@/lib/fetch-page";
 
 // Tool calling のループ本体を SSE でストリーミングする。
-// 各段の開始(phase)と結果(step)をリアルタイムに送出し、
-// クライアント側のワークフロー図がライブで進行できるようにする。
+// web_search / fetch_page の2ツールに対応。
+// 各段の開始(phase)と結果(step)をリアルタイムに送出する。
 
 export const dynamic = "force-dynamic";
 
-const MAX_STEPS = 4; // 無限ループ防止
+const MAX_STEPS = 5; // 無限ループ防止 (search→fetch→answer に余裕を持たせる)
 
 type Step =
   | { type: "llm_raw"; content: string }
-  | { type: "tool_call"; query: string }
+  | { type: "tool_call"; tool: "web_search" | "fetch_page"; arg: string }
   | {
-      type: "tool_result";
+      type: "search_result";
       query: string;
       results: { title: string; url: string; snippet: string }[];
     }
+  | { type: "fetch_result"; url: string; ok: boolean; chars: number }
   | { type: "final"; text: string }
   | { type: "error"; message: string };
 
 // ワークフローのフェーズ。クライアントの図のノードに対応する。
-type Phase = "llm" | "tool_call" | "search" | "feedback" | "final";
+type Phase = "llm" | "tool_call" | "tool_exec" | "feedback" | "final";
 
 type StreamEvent =
   | { kind: "phase"; phase: Phase; iter: number }
@@ -51,6 +53,11 @@ export async function POST(request: Request) {
       const send = (e: StreamEvent) => {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(e)}\n\n`));
       };
+      const finish = (answer: string) => {
+        send({ kind: "answer", answer });
+        send({ kind: "done" });
+        controller.close();
+      };
 
       try {
         for (let i = 0; i < MAX_STEPS; i++) {
@@ -66,57 +73,91 @@ export async function POST(request: Request) {
             // ツール要求なし = これが最終回答
             send({ kind: "phase", phase: "final", iter });
             send({ kind: "step", step: { type: "final", text: raw } });
-            send({ kind: "answer", answer: raw });
-            send({ kind: "done" });
-            controller.close();
+            finish(raw);
             return;
           }
 
-          // モデルがツールを要求した
           send({ kind: "phase", phase: "tool_call", iter });
-          send({
-            kind: "step",
-            step: { type: "tool_call", query: toolCall.query },
-          });
 
-          // SearXNG 検索実行
-          send({ kind: "phase", phase: "search", iter });
-          const results = await webSearch(toolCall.query);
-          send({
-            kind: "step",
-            step: {
-              type: "tool_result",
-              query: toolCall.query,
-              results,
-            },
-          });
+          if (toolCall.tool === "web_search") {
+            send({
+              kind: "step",
+              step: {
+                type: "tool_call",
+                tool: "web_search",
+                arg: toolCall.query,
+              },
+            });
 
-          // 結果を会話に戻して次ターンへ
-          send({ kind: "phase", phase: "feedback", iter });
-          convo.push({ role: "assistant", content: raw });
-          convo.push({
-            role: "user",
-            content:
-              `web_search("${toolCall.query}") の結果:\n\n` +
-              formatResultsForModel(results) +
-              `\n\nこの結果を踏まえてユーザーに日本語で最終回答してください。` +
-              `さらに検索が必要なら再度ツール JSON を出力しても構いません。`,
-          });
+            send({ kind: "phase", phase: "tool_exec", iter });
+            const results = await webSearch(toolCall.query);
+            send({
+              kind: "step",
+              step: {
+                type: "search_result",
+                query: toolCall.query,
+                results,
+              },
+            });
+
+            send({ kind: "phase", phase: "feedback", iter });
+            convo.push({ role: "assistant", content: raw });
+            convo.push({
+              role: "user",
+              content:
+                `web_search("${toolCall.query}") の結果:\n\n` +
+                formatResultsForModel(results) +
+                `\n\n上は概要のみです。ユーザーが具体的な事実(天気・数値・` +
+                `最新状況など)を求めている場合、概要だけで答えず、最も` +
+                `適切な URL に fetch_page を使って本文を読んでください。` +
+                `概要だけで十分なら日本語で最終回答してください。`,
+            });
+          } else {
+            // fetch_page
+            send({
+              kind: "step",
+              step: {
+                type: "tool_call",
+                tool: "fetch_page",
+                arg: toolCall.url,
+              },
+            });
+
+            send({ kind: "phase", phase: "tool_exec", iter });
+            const page = await fetchPage(toolCall.url);
+            send({
+              kind: "step",
+              step: {
+                type: "fetch_result",
+                url: page.url,
+                ok: page.ok,
+                chars: page.chars,
+              },
+            });
+
+            send({ kind: "phase", phase: "feedback", iter });
+            convo.push({ role: "assistant", content: raw });
+            convo.push({
+              role: "user",
+              content:
+                `fetch_page("${toolCall.url}") で取得した本文:\n\n` +
+                page.text +
+                `\n\nこの本文を根拠に、ユーザーの質問へ具体的に日本語で` +
+                `答えてください。本文に答えが無ければ別の URL を` +
+                `fetch_page するか web_search し直してください。`,
+            });
+          }
         }
 
-        // MAX_STEPS 到達: 最後にもう一度、検索結果を踏まえた回答を強制
+        // MAX_STEPS 到達: 最後にもう一度、取得済み情報で回答を強制
         send({ kind: "phase", phase: "final", iter: MAX_STEPS });
         const finalRaw = await chatCompletion(convo);
         send({ kind: "step", step: { type: "final", text: finalRaw } });
-        send({ kind: "answer", answer: finalRaw });
-        send({ kind: "done" });
-        controller.close();
+        finish(finalRaw);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         send({ kind: "step", step: { type: "error", message } });
-        send({ kind: "answer", answer: "" });
-        send({ kind: "done" });
-        controller.close();
+        finish("");
       }
     },
   });
